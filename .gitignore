@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+output/
+*.pth
+notify_local_sender.log

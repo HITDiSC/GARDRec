@@ -1,0 +1,16 @@
+modelscope
+transformers
+dotenv
+neo4j
+chromadb
+sentence_transformers
+openai
+accelerate
+tqdm
+numpy
+torch
+scikit-learn
+scipy
+pandas
+requests
+httpx
