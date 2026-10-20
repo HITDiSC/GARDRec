@@ -30,6 +30,7 @@ class GCNRecommendationTrainer:
         self.model.to(self.device)
         self.best_loss = float("inf")
         self.best_top1 = 0.0
+        self.best_epoch = 0
         self.model_save_path = model_save_path
         self.metrics_log_path = metrics_log_path
 
@@ -146,9 +147,10 @@ class GCNRecommendationTrainer:
         self.model.candidate_marker.requires_grad_(True)
         self.model.candidate_slot_embeddings.requires_grad_(True)
         self.model.answer_query.requires_grad_(True)
-        self.model.mean_history_weight.requires_grad_(True)
-        self.model.retrieval_weight.requires_grad_(True)
-        self.model.match_weight.requires_grad_(True)
+        learnable_fusion = getattr(self.model, 'fusion_weight_mode', 'learnable') == 'learnable'
+        self.model.mean_history_weight.requires_grad_(learnable_fusion)
+        self.model.retrieval_weight.requires_grad_(learnable_fusion)
+        self.model.match_weight.requires_grad_(learnable_fusion)
         if getattr(self.model, "interaction_feature_norm", None) is not None:
             self.model.interaction_feature_norm.requires_grad_(True)
         if getattr(self.model, "interaction_scorer", None) is not None:
@@ -156,11 +158,21 @@ class GCNRecommendationTrainer:
         if getattr(self.model, "interaction_score_weight", None) is not None:
             self.model.interaction_score_weight.requires_grad_(True)
 
-    def train(self, dataloader, epochs=3, lr=5e-5, eval_dataloader=None):
+    def train(
+        self,
+        dataloader,
+        epochs=3,
+        lr=5e-5,
+        eval_dataloader=None,
+        weight_decay=0.0,
+        early_stopping_patience=0,
+        early_stopping_min_delta=0.0,
+    ):
         self._set_trainable()
         optimizer = torch.optim.AdamW(
             filter(lambda param: param.requires_grad, self.model.parameters()),
             lr=lr,
+            weight_decay=weight_decay,
         )
         total_steps = len(dataloader) * epochs
         warmup_steps = max(1, total_steps // 10)
@@ -171,6 +183,7 @@ class GCNRecommendationTrainer:
             pct_start=warmup_steps / total_steps,
             anneal_strategy="cos",
         )
+        patience_counter = 0
 
         for epoch in range(epochs):
             if self.model.gen_loss_warmup_epochs > 0:
@@ -180,6 +193,11 @@ class GCNRecommendationTrainer:
                 self.model.current_gen_loss_weight = self.model.gen_loss_weight
             self.model.train()
             total_loss = 0.0
+            logger.info(
+                "Epoch %s effective gen_loss_weight: %.4f",
+                epoch + 1,
+                self.model.current_gen_loss_weight,
+            )
             pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
             for batch_idx, batch in enumerate(pbar):
                 input_ids = batch["input_ids"].to(self.device)
@@ -217,11 +235,44 @@ class GCNRecommendationTrainer:
                 optimizer.step()
                 scheduler.step()
                 total_loss += loss.item()
+                ce_loss_val = outputs.ce_loss.item() if outputs.ce_loss is not None else 0.0
+                ranking_loss_val = (
+                    outputs.ranking_loss.item()
+                    if outputs.ranking_loss is not None
+                    else 0.0
+                )
+                gen_loss_val = outputs.gen_loss.item() if outputs.gen_loss is not None else 0.0
+                aux_loss_val = (
+                    outputs.aux_loss.item()
+                    if getattr(outputs, "aux_loss", None) is not None
+                    else 0.0
+                )
                 pbar.set_postfix({
                     "batch_loss": f"{loss.item():.4f}",
+                    "ce_loss": f"{ce_loss_val:.4f}",
+                    "rank_loss": f"{ranking_loss_val:.4f}",
+                    "aux_loss": f"{aux_loss_val:.4f}",
+                    "gen_loss": f"{gen_loss_val:.4f}",
                     "avg_loss": f"{total_loss / (batch_idx + 1):.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
+                completed_batches = batch_idx + 1
+                if completed_batches % 20 == 0 or completed_batches == len(dataloader):
+                    logger.info(
+                        "Epoch %s/%s progress: %s/%s batches (%.1f%%), avg_loss=%.4f, "
+                        "ce=%.4f, rank=%.4f, aux=%.4f, gen=%.4f, lr=%.2e",
+                        epoch + 1,
+                        epochs,
+                        completed_batches,
+                        len(dataloader),
+                        100.0 * completed_batches / len(dataloader),
+                        total_loss / completed_batches,
+                        ce_loss_val,
+                        ranking_loss_val,
+                        aux_loss_val,
+                        gen_loss_val,
+                        scheduler.get_last_lr()[0],
+                    )
 
             avg_loss = total_loss / len(dataloader)
             logger.info("Epoch %s completed. Average loss: %.4f", epoch + 1, avg_loss)
@@ -244,14 +295,56 @@ class GCNRecommendationTrainer:
                         "top5_acc": float(eval_metrics["top5_acc"]),
                     },
                 )
-                if eval_metrics["top1_acc"] > self.best_top1:
+                if eval_metrics["top1_acc"] > self.best_top1 + early_stopping_min_delta:
                     self.best_top1 = eval_metrics["top1_acc"]
+                    self.best_epoch = epoch + 1
                     self.save_probehead()
-                    logger.info("New best top-1: %.4f, checkpoint saved", self.best_top1)
+                    patience_counter = 0
+                    logger.info(
+                        "New best top-1: %.4f at epoch %s, checkpoint saved",
+                        self.best_top1,
+                        epoch + 1,
+                    )
+                else:
+                    patience_counter += 1
+                    logger.info(
+                        "No Top-1 improvement at epoch %s (%s/%s without improvement, best=%.4f)",
+                        epoch + 1,
+                        patience_counter,
+                        early_stopping_patience,
+                        self.best_top1,
+                    )
+                    if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+                        logger.info(
+                            "Early stopping at epoch %s. Best epoch: %s, best Top-1: %.4f",
+                            epoch + 1,
+                            self.best_epoch,
+                            self.best_top1,
+                        )
+                        break
             else:
-                if avg_loss < self.best_loss:
+                if avg_loss < self.best_loss - early_stopping_min_delta:
                     self.best_loss = avg_loss
+                    self.best_epoch = epoch + 1
                     self.save_probehead()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    logger.info(
+                        "No loss improvement at epoch %s (%s/%s without improvement, best=%.4f)",
+                        epoch + 1,
+                        patience_counter,
+                        early_stopping_patience,
+                        self.best_loss,
+                    )
+                    if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+                        logger.info(
+                            "Early stopping at epoch %s. Best epoch: %s, best loss: %.4f",
+                            epoch + 1,
+                            self.best_epoch,
+                            self.best_loss,
+                        )
+                        break
 
     def _build_gen_debug_info(self, outputs, labels: torch.Tensor):
         if outputs.gen_logits is None:
@@ -338,6 +431,8 @@ class GCNRecommendationTrainer:
             "top1_acc": top1_total / sample_count if sample_count else 0.0,
             "top3_acc": top3_total / sample_count if sample_count else 0.0,
             "top5_acc": top5_total / sample_count if sample_count else 0.0,
+            "fusion_weight_mode": getattr(self.model, 'fusion_weight_mode', 'learnable'),
+            "fusion_weights": self.model.fusion_weight_values() if hasattr(self.model, 'fusion_weight_values') else {},
         }
         logger.info(
             "Evaluation completed. Top-1: %.4f, Top-3: %.4f, Top-5: %.4f",

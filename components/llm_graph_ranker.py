@@ -8,6 +8,11 @@ from modelscope import AutoModelForCausalLM
 from .config import logger
 
 
+def inverse_softplus(value: float) -> torch.Tensor:
+    value_t = torch.tensor(float(value), dtype=torch.float32)
+    return torch.log(torch.expm1(value_t))
+
+
 class LLMGraphRanker(nn.Module):
     def __init__(
         self,
@@ -17,6 +22,7 @@ class LLMGraphRanker(nn.Module):
         num_candidates: int,
         match_feature_dim: int,
         interaction_feature_dim: int = 0,
+        dropout: float = 0.1,
         scoring_mode: str = "gcn",
         ce_loss_weight: float = 1.0,
         ranking_loss_weight: float = 0.2,
@@ -26,6 +32,10 @@ class LLMGraphRanker(nn.Module):
         gen_loss_weight: float = 0.3,
         gen_inference_weight: float = 0.0,
         gen_loss_warmup_epochs: int = 0,
+        fusion_weight_mode: str = 'learnable',
+        eta1_init: float = 0.5,
+        eta2_init: float = 0.5,
+        match_weight_init: float = 0.3,
         label_token_ids: Optional[List[int]] = None,
         answer_prompt_ids: Optional[List[int]] = None,
     ):
@@ -37,6 +47,14 @@ class LLMGraphRanker(nn.Module):
             dtype=model_dtype,
             device_map="auto",
         )
+        if hasattr(self.llm, "gradient_checkpointing_enable"):
+            try:
+                self.llm.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                self.llm.gradient_checkpointing_enable()
+            logger.info("Enabled gradient checkpointing for %s", model_name)
         self.llm_dtype = next(self.llm.parameters()).dtype
         self.device = next(self.llm.parameters()).device
         for param in self.llm.parameters():
@@ -48,19 +66,19 @@ class LLMGraphRanker(nn.Module):
         self.history_aware_scorer = nn.Sequential(
             nn.Linear(self.hidden_size * 4, self.hidden_size),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(self.hidden_size, 1),
         )
         self.retrieval_aware_scorer = nn.Sequential(
             nn.Linear(self.hidden_size * 4, self.hidden_size),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(self.hidden_size, 1),
         )
         self.candidate_match_scorer = nn.Sequential(
             nn.Linear(match_feature_dim, self.hidden_size),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(self.hidden_size, 1),
         )
         self.interaction_feature_dim = interaction_feature_dim
@@ -69,10 +87,10 @@ class LLMGraphRanker(nn.Module):
             self.interaction_scorer = nn.Sequential(
                 nn.Linear(interaction_feature_dim, self.hidden_size),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(self.hidden_size, 1),
             )
-            self.interaction_score_weight = nn.Parameter(torch.tensor(0.05))
+            self.interaction_score_weight = nn.Parameter(inverse_softplus(0.7))
         else:
             self.interaction_feature_norm = None
             self.interaction_scorer = None
@@ -80,12 +98,20 @@ class LLMGraphRanker(nn.Module):
         self.mean_history_scorer = nn.Sequential(
             nn.Linear(self.hidden_size * 4, self.hidden_size),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(self.hidden_size, 1),
         )
-        self.mean_history_weight = nn.Parameter(torch.tensor(0.50))
-        self.retrieval_weight = nn.Parameter(torch.tensor(0.50))
-        self.match_weight = nn.Parameter(torch.tensor(0.30))
+        self.fusion_weight_mode = fusion_weight_mode
+        self.eta1_init = float(eta1_init)
+        self.eta2_init = float(eta2_init)
+        self.match_weight_init = float(match_weight_init)
+        self.mean_history_weight = nn.Parameter(inverse_softplus(self.eta1_init))
+        self.retrieval_weight = nn.Parameter(inverse_softplus(self.eta2_init))
+        self.match_weight = nn.Parameter(inverse_softplus(self.match_weight_init))
+        if self.fusion_weight_mode == 'fixed':
+            self.mean_history_weight.requires_grad_(False)
+            self.retrieval_weight.requires_grad_(False)
+            self.match_weight.requires_grad_(False)
         self.match_feature_norm = nn.LayerNorm(match_feature_dim)
         self.history_position_embeddings = nn.Parameter(
             torch.randn(1, num_history, self.llm.config.hidden_size) * 0.02
@@ -93,7 +119,7 @@ class LLMGraphRanker(nn.Module):
         self.inter_candidate_attn = nn.MultiheadAttention(
             embed_dim=self.hidden_size,
             num_heads=8,
-            dropout=0.1,
+            dropout=dropout,
             batch_first=True,
         )
         self.inter_candidate_norm = nn.LayerNorm(self.hidden_size)
@@ -274,10 +300,8 @@ class LLMGraphRanker(nn.Module):
             ).squeeze(-1)
             inter_weight = F.softplus(self.interaction_score_weight)
             candidate_scores = candidate_scores + inter_weight * inter_scores
-            if self.training:
-                return candidate_scores, base_candidate_scores
-            else:
-                return candidate_scores
+        if self.training:
+            return candidate_scores, base_candidate_scores
         return candidate_scores
 
     def _compute_ranking_loss(
@@ -294,6 +318,19 @@ class LLMGraphRanker(nn.Module):
             negative_scores, _ = negative_scores.topk(k, dim=1)
         bpr_loss = -F.logsigmoid(positive_scores - negative_scores).mean()
         return bpr_loss
+
+    @torch.no_grad()
+    def fusion_weight_values(self):
+        values = {
+            'mean_history': float(F.softplus(self.mean_history_weight).item()),
+            'retrieval': float(F.softplus(self.retrieval_weight).item()),
+            'match': float(F.softplus(self.match_weight).item()),
+        }
+        if self.interaction_score_weight is not None:
+            values['interaction'] = float(F.softplus(self.interaction_score_weight).item())
+        else:
+            values['interaction'] = 0.0
+        return values
 
     def forward(
         self,

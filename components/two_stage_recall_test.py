@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 
-def load_ratings_stats(ratings_path: Optional[str]):
+def load_ratings_stats(ratings_path: Optional[str], allowed_pairs: Optional[set] = None):
     if not ratings_path or not os.path.exists(ratings_path):
         return {}, {}, set(), 0, 0
 
@@ -32,6 +32,8 @@ def load_ratings_stats(ratings_path: Optional[str]):
                 rating = float(parts[2])
                 ts = int(parts[3]) if len(parts) > 3 else 0
             except Exception:
+                continue
+            if allowed_pairs is not None and (user, item) not in allowed_pairs:
                 continue
             user_sum[user] = user_sum.get(user, 0.0) + rating
             user_count[user] = user_count.get(user, 0) + 1

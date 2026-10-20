@@ -7,7 +7,26 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from .config import logger
 from .utils import build_ranking_prompt_with_mode, compute_label_token_ids, compute_answer_prompt_ids
+
+
+DEFAULT_INTERACTION_FEATURE_NAMES = [
+    "gsim",
+    "lmax",
+    "first_norm",
+    "user_avg_feat",
+    "user_cnt_feat",
+    "item_avg_feat",
+    "item_cnt_feat",
+    "user_rated_flag",
+    "co_feat",
+    "trans_feat",
+    "genre_feat",
+    "rank_feat",
+    "co_trans_mul",
+    "co_trans_absdiff",
+]
 
 
 def resolve_input_file(domain: str) -> str:
@@ -21,6 +40,7 @@ def resolve_input_file(domain: str) -> str:
         ]
     elif domain == "ml1m":
         candidate_paths = [
+            "./data/dataset/ML1M/parse_data/train_from_10000_data_id_20.json",
             "./data/dataset/ML1M/parse_data/train.json",
         ]
     for path in candidate_paths:
@@ -67,8 +87,14 @@ def load_retrieval_details(detail_file: str) -> Tuple[Dict[str, Dict], List[str]
                 break
         if inferred_dim <= 0:
             names = []
+        elif inferred_dim <= len(DEFAULT_INTERACTION_FEATURE_NAMES):
+            names = DEFAULT_INTERACTION_FEATURE_NAMES[:inferred_dim]
         else:
-            names = [f"interaction_extra_{i}" for i in range(inferred_dim)]
+            names = list(DEFAULT_INTERACTION_FEATURE_NAMES)
+            names.extend(
+                f"interaction_extra_{i}"
+                for i in range(inferred_dim - len(DEFAULT_INTERACTION_FEATURE_NAMES))
+            )
     return normalized_map, names
 
 
@@ -116,6 +142,8 @@ def attach_retrieval_details(
             interaction_feature_names,
             interaction_feature_whitelist,
         )
+    if missing_detail_count:
+        logger.warning("Missing retrieval details for %s samples", missing_detail_count)
     return samples
 
 
@@ -128,4 +156,8 @@ def infer_interaction_feature_dim(samples: List[Dict], num_candidates: int) -> i
         if arr.ndim != 2 or arr.shape[0] == 0:
             continue
         return int(arr.shape[1])
+    logger.warning(
+        "No interaction_features found in samples, fallback to dim=0. "
+        "Run preprocess_retrieval_augmented_samples_patch.py to generate enhanced details file."
+    )
     return 0

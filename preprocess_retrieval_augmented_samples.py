@@ -49,7 +49,7 @@ def build_and_save_augmented_samples(
     num_samples: Optional[int] = None,
     max_workers: Optional[int] = None,
 ) -> str:
-    input_file = input_file or ("./data/dataset/AmazonBook/parse_data/train.json" if domain == "amazonbook" else "./data/dataset/ML20M/parse_data/train.json" if domain == "ml20m" else "./data/dataset/ML1M/parse_data/train.json")
+    input_file = input_file or ("./data/dataset/AmazonBook/parse_data/train.json" if domain == "amazonbook" else "./data/dataset/ML20M/parse_data/train.json" if domain == "ml20m" else "./data/dataset/ML1M/parse_data/train_from_10000_data_id_20.json")
     output_file = output_file or resolve_output_file(domain)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
@@ -88,6 +88,8 @@ def build_and_save_augmented_samples(
 
     logger.info("Enriching %s samples using %s workers", len(samples), max_workers)
     augmented_samples = []
+    completed = 0
+    total = len(samples)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {executor.submit(retrieval_builder.enrich_sample, sample): i for i, sample in enumerate(samples)}
         for fut in as_completed(future_to_idx):
@@ -96,6 +98,9 @@ def build_and_save_augmented_samples(
                 augmented_samples.append(res)
             except Exception as e:
                 logger.exception("Error enriching a sample: %s", e)
+            completed += 1
+            if completed % 50 == 0 or completed == total:
+                logger.info("Preprocess progress: %s/%s", completed, total)
 
     serialized_details = [serialize_retrieval_detail(sample) for sample in augmented_samples]
     details_by_sample_idx = {

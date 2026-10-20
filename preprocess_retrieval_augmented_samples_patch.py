@@ -92,7 +92,7 @@ def update_historical_cooccurrence(co_map: Dict[str, Dict[str, int]], hist: List
     for left_idx in range(n):
         left_id = uniq[left_idx]
         for right_idx in range(left_idx + 1, n):
-            right_id = uniq[right_id]
+            right_id = uniq[right_idx]
             left_bucket = co_map.setdefault(left_id, {})
             right_bucket = co_map.setdefault(right_id, {})
             left_bucket[right_id] = left_bucket.get(right_id, 0) + 1
@@ -322,7 +322,25 @@ def main():
     if args.num_samples is not None:
         samples = samples[: args.num_samples]
 
-    ratings_stats = load_ratings_stats(ratings_path)
+    stats_sample_count = int(len(samples) * args.train_ratio)
+    stats_sample_count = max(1, min(stats_sample_count, len(samples))) if samples else 0
+    allowed_pairs = set()
+    for s in samples[:stats_sample_count]:
+        sid = str(s.get("sample_idx"))
+        entry = entries_by_idx.get(sid, {})
+        user_id = str(entry.get("user_id")) if entry.get("user_id") is not None else None
+        if user_id is None:
+            continue
+        for movie in s.get("history_movies", []):
+            item_id = str(movie.get("original_id") or "")
+            if item_id:
+                allowed_pairs.add((user_id, item_id))
+    logger.info(
+        "Restricting rating statistics to %s training-prefix samples (%s user-item pairs)",
+        stats_sample_count,
+        len(allowed_pairs),
+    )
+    ratings_stats = load_ratings_stats(ratings_path, allowed_pairs=allowed_pairs)
     if len(ratings_stats) == 6:
         user_stats, item_stats, user_item_set, max_user_count, max_item_count, _ = ratings_stats
     else:
@@ -404,9 +422,11 @@ def main():
         "split_first_prefix": bool(args.split_first_prefix),
         "train_ratio": float(args.train_ratio),
         "freeze_eval_prefix": bool(args.freeze_eval_prefix),
+        "stats_scope": "train_history_only",
+        "stats_sample_count": stats_sample_count,
     }
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(payload_out, f, ensure_ascii=False, indent=2)
+        json.dump(payload_out, f, ensure_ascii=False, separators=(",", ":"))
 
     logger.info("Saved patched retrieval details to %s", output_file)
 
