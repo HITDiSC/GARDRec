@@ -1,0 +1,6 @@
+{
+    "top1_acc": 0.445916114790287,
+    "top3_acc": 0.8200883002207505,
+    "top5_acc": 0.9415011037527594,
+    "model_name": "/data/WY/models/Qwen2-7B-Instruct"
+}
