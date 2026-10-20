@@ -4,3 +4,6 @@ __pycache__/
 output/
 *.pth
 notify_local_sender.log
+.tmp/
+baselines/*/hard10_train.json
+data/v2_ml1m_input.json
